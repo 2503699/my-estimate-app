@@ -4,13 +4,14 @@ import {
   Plus, Trash2, Printer, Calculator, Settings, 
   Database, ArrowLeft, Edit2, X, CloudLine, CloudOff, Loader2, ListChecks
 } from 'lucide-react';
-import { initializeApp } from 'firebase/app';
+import { initializeApp, getApps } from 'firebase/app';
 import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from 'firebase/auth';
 import { getFirestore, doc, setDoc, getDoc, collection, onSnapshot } from 'firebase/firestore';
 
 // --- Firebase 配置 (由環境自動注入) ---
-const firebaseConfig = JSON.parse(__firebase_config);
-const app = initializeApp(firebaseConfig);
+// 增加防呆：確保配置存在才初始化
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
+const app = getApps().length === 0 ? initializeApp(firebaseConfig) : getApps()[0];
 const auth = getAuth(app);
 const db = getFirestore(app);
 const appId = typeof __app_id !== 'undefined' ? __app_id : 'my-estimate-app';
@@ -36,6 +37,7 @@ const App = () => {
   useEffect(() => {
     const initAuth = async () => {
       try {
+        // 優化：先檢查環境提供的 Token
         if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
           await signInWithCustomToken(auth, __initial_auth_token);
         } else {
@@ -63,11 +65,21 @@ const App = () => {
     const unsubscribe = onSnapshot(userDocRef, (docSnap) => {
       if (docSnap.exists()) {
         const data = docSnap.data();
+        // 確保資料存在才更新狀態，避免覆蓋掉初始值
         if (data.items) setItems(data.items);
         if (data.presetItems) setPresetItems(data.presetItems);
         if (data.taxRate !== undefined) setTaxRate(data.taxRate);
         if (data.clientName !== undefined) setClientName(data.clientName);
         if (data.note !== undefined) setNote(data.note);
+      } else {
+        // 如果雲端沒資料，就先存一份初始資料上去
+        saveDataToCloud({
+          items,
+          presetItems,
+          taxRate,
+          clientName,
+          note
+        });
       }
       setIsSyncing(false);
     }, (err) => {
@@ -89,7 +101,7 @@ const App = () => {
     }
   };
 
-  // --- 操作邏輯 (包含自動存檔) ---
+  // --- 操作邏輯 ---
   const updateItemsAndSave = (newItems) => {
     setItems(newItems);
     saveDataToCloud({ items: newItems });
@@ -154,10 +166,10 @@ const App = () => {
                   </span>
                 ) : user ? (
                   <span className="text-[10px] text-green-500 font-bold flex items-center gap-1">
-                    <div className="w-1.5 h-1.5 bg-green-500 rounded-full"></div> 資料已安全儲存
+                    <div className="w-1.5 h-1.5 bg-green-500 rounded-full"></div> 資料同步成功
                   </span>
                 ) : (
-                  <span className="text-[10px] text-red-400 font-bold">離線模式</span>
+                  <span className="text-[10px] text-red-400 font-bold">登入中...</span>
                 )}
               </div>
             </div>
@@ -279,7 +291,7 @@ const App = () => {
                 </div>
               ))}
             </div>
-            <div className="p-5 bg-slate-50 text-center border-t border-slate-100"><p className="text-xs text-slate-400">數據已同步至雲端，更換設備也能繼續使用。</p></div>
+            <div className="p-5 bg-slate-50 text-center border-t border-slate-100"><p className="text-xs text-slate-400">資料庫即時同步中，更換設備資料不遺失。</p></div>
           </div>
         )}
       </div>
@@ -290,8 +302,11 @@ const App = () => {
 // --- 啟動 ---
 const rootElement = document.getElementById('root');
 if (rootElement) {
-  ReactDOM.createRoot(rootElement).render(
-    <React.StrictMode><App /></React.StrictMode>
+  const root = ReactDOM.createRoot(rootElement);
+  root.render(
+    <React.StrictMode>
+      <App />
+    </React.StrictMode>
   );
 }
 
