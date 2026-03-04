@@ -2,185 +2,284 @@ import React, { useState, useEffect, useMemo } from 'react';
 import ReactDOM from 'react-dom/client';
 import { 
   Plus, Trash2, Printer, Calculator, Settings, 
-  Save, Database, ArrowLeft, Edit2, Check, 
-  Sparkles, Loader2, MessageSquare, ListChecks 
+  Database, ArrowLeft, Edit2, X, CloudLine, CloudOff, Loader2, ListChecks
 } from 'lucide-react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from 'firebase/auth';
+import { getFirestore, doc, setDoc, getDoc, collection, onSnapshot } from 'firebase/firestore';
 
-// --- 配置區 ---
-const apiKey = ""; // 執行環境會自動注入
+// --- Firebase 配置 (由環境自動注入) ---
+const firebaseConfig = JSON.parse(__firebase_config);
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'my-estimate-app';
 
 const App = () => {
   // --- 狀態管理 ---
   const [view, setView] = useState('estimate');
-  const [items, setItems] = useState(() => {
-    const saved = localStorage.getItem('est_current_items');
-    return saved ? JSON.parse(saved) : [{ id: 1, name: '', price: 0, quantity: 1, unit: '個', subtotal: 0 }];
-  });
-  
-  const [presetItems, setPresetItems] = useState(() => {
-    const saved = localStorage.getItem('est_presets');
-    const defaultPresets = [
-      { id: 'p1', name: '水泥', price: 200, unit: '包' },
-      { id: 'p2', name: '矽利康', price: 100, unit: '支' },
-      { id: 'p3', name: '油漆粉刷', price: 150, unit: '平方米' }
-    ];
-    return saved ? JSON.parse(saved) : defaultPresets;
-  });
+  const [user, setUser] = useState(null);
+  const [isSyncing, setIsSyncing] = useState(true);
 
+  // 數據狀態
+  const [items, setItems] = useState([{ id: 1, name: '', price: 0, quantity: 1, unit: '個', subtotal: 0 }]);
+  const [presetItems, setPresetItems] = useState([
+    { id: 'p1', name: '水泥施工', price: 2000, unit: '坪' },
+    { id: 'p2', name: '矽利康填補', price: 150, unit: '支' },
+    { id: 'p3', name: '油漆工程', price: 800, unit: '面' }
+  ]);
   const [taxRate, setTaxRate] = useState(5);
   const [clientName, setClientName] = useState('');
   const [note, setNote] = useState('');
-  const [isAiLoading, setIsAiLoading] = useState(false);
 
-  // --- 持久化儲存 ---
+  // --- 1. 身分驗證 (Rule 3) ---
   useEffect(() => {
-    localStorage.setItem('est_current_items', JSON.stringify(items));
-    localStorage.setItem('est_presets', JSON.stringify(presetItems));
-  }, [items, presetItems]);
-
-  // --- AI 功能 ---
-  const callGemini = async (prompt, retryCount = 0) => {
-    try {
-      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
-      });
-      if (response.status === 429 && retryCount < 5) {
-        await new Promise(r => setTimeout(r, Math.pow(2, retryCount) * 1000));
-        return callGemini(prompt, retryCount + 1);
+    const initAuth = async () => {
+      try {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          await signInWithCustomToken(auth, __initial_auth_token);
+        } else {
+          await signInAnonymously(auth);
+        }
+      } catch (err) {
+        console.error("Auth Error", err);
       }
-      const data = await response.json();
-      return data.candidates?.[0]?.content?.parts?.[0]?.text;
-    } catch (e) { return null; }
-  };
+    };
+    initAuth();
+    const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
+      setUser(currentUser);
+    });
+    return () => unsubscribe();
+  }, []);
 
-  const generateAiNote = async () => {
-    setIsAiLoading(true);
-    const names = items.map(i => i.name).filter(n => n).join(', ');
-    const prompt = `你是一位專業工程專家。請根據品項：[${names}]，為客戶[${clientName || '顧客'}]撰寫150字專業估價備註。包含付款建議、保固、免責聲明。直接輸出文字。`;
-    const result = await callGemini(prompt);
-    if (result) setNote(result.trim());
-    setIsAiLoading(false);
-  };
+  // --- 2. 資料讀取 (Rule 1 & 2) ---
+  useEffect(() => {
+    if (!user) return;
 
-  const suggestPrice = async (id, name) => {
-    if (!name) return;
-    setIsAiLoading(true);
-    const result = await callGemini(`請提供台灣市場「${name}」的目前合理行情數字。只回傳一個數字，不要文字。`);
-    if (result) {
-      const price = parseFloat(result.replace(/[^0-9.]/g, ''));
-      if (!isNaN(price)) updateItem(id, 'price', price);
+    // 取得該使用者的專屬私有路徑
+    const userDocRef = doc(db, 'artifacts', appId, 'users', user.uid, 'settings', 'appData');
+    
+    setIsSyncing(true);
+    const unsubscribe = onSnapshot(userDocRef, (docSnap) => {
+      if (docSnap.exists()) {
+        const data = docSnap.data();
+        if (data.items) setItems(data.items);
+        if (data.presetItems) setPresetItems(data.presetItems);
+        if (data.taxRate !== undefined) setTaxRate(data.taxRate);
+        if (data.clientName !== undefined) setClientName(data.clientName);
+        if (data.note !== undefined) setNote(data.note);
+      }
+      setIsSyncing(false);
+    }, (err) => {
+      console.error("Firestore Listen Error", err);
+      setIsSyncing(false);
+    });
+
+    return () => unsubscribe();
+  }, [user]);
+
+  // --- 3. 資料存檔 (Rule 1) ---
+  const saveDataToCloud = async (newData) => {
+    if (!user) return;
+    const userDocRef = doc(db, 'artifacts', appId, 'users', user.uid, 'settings', 'appData');
+    try {
+      await setDoc(userDocRef, newData, { merge: true });
+    } catch (err) {
+      console.error("Cloud Save Error", err);
     }
-    setIsAiLoading(false);
   };
 
-  // --- 計算與操作 ---
+  // --- 操作邏輯 (包含自動存檔) ---
+  const updateItemsAndSave = (newItems) => {
+    setItems(newItems);
+    saveDataToCloud({ items: newItems });
+  };
+
+  const updatePresetsAndSave = (newPresets) => {
+    setPresetItems(newPresets);
+    saveDataToCloud({ presetItems: newPresets });
+  };
+
   const totals = useMemo(() => {
     const sub = items.reduce((s, i) => s + (Number(i.price) * Number(i.quantity)), 0);
     const tax = Math.round(sub * (taxRate / 100));
     return { sub, tax, total: sub + tax };
   }, [items, taxRate]);
 
-  const addItem = () => setItems([...items, { id: Date.now(), name: '', price: 0, quantity: 1, unit: '個', subtotal: 0 }]);
-  const removeItem = (id) => items.length > 1 && setItems(items.filter(i => i.id !== id));
+  // 估價單操作
+  const addItem = () => updateItemsAndSave([...items, { id: Date.now(), name: '', price: 0, quantity: 1, unit: '個', subtotal: 0 }]);
+  const removeItem = (id) => items.length > 1 && updateItemsAndSave(items.filter(i => i.id !== id));
   const updateItem = (id, f, v) => {
-    setItems(items.map(i => {
+    const newItems = items.map(i => {
       if (i.id === id) {
         let u = { ...i, [f]: v };
         if (f === 'name') {
           const p = presetItems.find(x => x.name === v);
           if (p) { u.price = p.price; u.unit = p.unit; }
         }
-        u.subtotal = u.price * u.quantity;
+        u.subtotal = Number(u.price) * Number(u.quantity);
         return u;
       }
       return i;
-    }));
+    });
+    updateItemsAndSave(newItems);
+  };
+
+  // 資料庫操作
+  const addPreset = () => updatePresetsAndSave([...presetItems, { id: Date.now(), name: '新項目', price: 0, unit: '個' }]);
+  const removePreset = (id) => updatePresetsAndSave(presetItems.filter(p => p.id !== id));
+  const updatePreset = (id, f, v) => {
+    const newPresets = presetItems.map(p => p.id === id ? { ...p, [f]: v } : p);
+    updatePresetsAndSave(newPresets);
   };
 
   return (
-    <div className="min-h-screen bg-slate-50 py-8 px-4">
-      {isAiLoading && (
-        <div className="fixed top-4 left-1/2 -translate-x-1/2 z-50 bg-white shadow-xl rounded-full px-6 py-2 flex items-center gap-3 border border-blue-100 animate-bounce">
-          <Sparkles className="w-5 h-5 text-blue-500" />
-          <span className="text-sm font-bold">AI 正在運算中...</span>
-        </div>
-      )}
-
-      <div className="max-w-4xl mx-auto bg-white shadow-2xl rounded-2xl overflow-hidden print:shadow-none">
-        <div className="bg-slate-900 p-6 text-white flex justify-between items-center">
-          <h1 className="text-2xl font-bold flex items-center gap-2">
-            <Calculator className="w-7 h-7 text-blue-400" /> 
-            {view === 'estimate' ? 'AI 專業估價系統' : '品項資料庫'}
-          </h1>
-          <div className="flex gap-2 print:hidden">
-            <button onClick={() => setView(view === 'estimate' ? 'manage' : 'estimate')} className="bg-slate-700 px-4 py-2 rounded-lg text-sm">
-              {view === 'estimate' ? '管理品項' : '返回估價'}
-            </button>
-            <button onClick={() => window.print()} className="bg-blue-600 px-4 py-2 rounded-lg text-sm">列印</button>
+    <div className="min-h-screen bg-slate-100 py-6 px-3 sm:px-6">
+      <div className="max-w-4xl mx-auto space-y-4">
+        
+        {/* 頂部狀態列 */}
+        <div className="bg-white p-5 rounded-2xl shadow-sm flex justify-between items-center border border-slate-200">
+          <div className="flex items-center gap-3">
+            <div className="bg-slate-800 p-2.5 rounded-xl text-white">
+              <Calculator className="w-6 h-6" />
+            </div>
+            <div>
+              <h1 className="text-xl font-black text-slate-800 tracking-tight">
+                {view === 'estimate' ? '雲端估價助手' : '項目資料管理'}
+              </h1>
+              <div className="flex items-center gap-2">
+                {isSyncing ? (
+                  <span className="text-[10px] text-blue-500 font-bold flex items-center gap-1 animate-pulse">
+                    <Loader2 className="w-3 h-3 animate-spin" /> 雲端同步中...
+                  </span>
+                ) : user ? (
+                  <span className="text-[10px] text-green-500 font-bold flex items-center gap-1">
+                    <div className="w-1.5 h-1.5 bg-green-500 rounded-full"></div> 資料已安全儲存
+                  </span>
+                ) : (
+                  <span className="text-[10px] text-red-400 font-bold">離線模式</span>
+                )}
+              </div>
+            </div>
           </div>
+          <button 
+            onClick={() => setView(view === 'estimate' ? 'manage' : 'estimate')}
+            className={`p-3 rounded-xl transition-all flex items-center gap-2 font-bold text-sm ${
+              view === 'estimate' ? 'bg-slate-100 text-slate-600' : 'bg-blue-600 text-white shadow-lg shadow-blue-200'
+            }`}
+          >
+            {view === 'estimate' ? <><Settings className="w-5 h-5" /> 管理品項</> : <><ArrowLeft className="w-5 h-5" /> 返回估價</>}
+          </button>
         </div>
 
         {view === 'estimate' ? (
-          <div className="p-6 space-y-6">
-            <div className="grid grid-cols-2 gap-4">
-              <input placeholder="客戶名稱" value={clientName} onChange={e => setClientName(e.target.value)} className="p-3 border rounded-xl" />
-              <input type="number" placeholder="稅率 %" value={taxRate} onChange={e => setTaxRate(Number(e.target.value))} className="p-3 border rounded-xl" />
-            </div>
-
-            <div className="border rounded-xl overflow-hidden">
-              <table className="w-full text-left">
-                <thead className="bg-slate-50 text-xs font-bold text-slate-500">
-                  <tr>
-                    <th className="p-4">項目</th>
-                    <th className="p-4 w-20">單位</th>
-                    <th className="p-4 w-32">單價</th>
-                    <th className="p-4 w-20">數量</th>
-                    <th className="p-4 w-32 text-right">小計</th>
-                    <th className="p-4 w-10 print:hidden"></th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y">
-                  {items.map(item => (
-                    <tr key={item.id}>
-                      <td className="p-2 flex items-center gap-2">
-                        <input list="presets" value={item.name} onChange={e => updateItem(item.id, 'name', e.target.value)} className="w-full p-2 outline-none" />
-                        <datalist id="presets">{presetItems.map(p => <option key={p.id} value={p.name} />)}</datalist>
-                        <button onClick={() => suggestPrice(item.id, item.name)} className="text-blue-400 hover:text-blue-600 print:hidden"><Sparkles className="w-4 h-4"/></button>
-                      </td>
-                      <td className="p-2"><input value={item.unit} onChange={e => updateItem(item.id, 'unit', e.target.value)} className="w-full outline-none" /></td>
-                      <td className="p-2"><input type="number" value={item.price} onChange={e => updateItem(item.id, 'price', Number(e.target.value))} className="w-full outline-none" /></td>
-                      <td className="p-2"><input type="number" value={item.quantity} onChange={e => updateItem(item.id, 'quantity', Number(e.target.value))} className="w-full outline-none" /></td>
-                      <td className="p-2 text-right font-bold">${item.subtotal.toLocaleString()}</td>
-                      <td className="p-2 print:hidden"><button onClick={() => removeItem(item.id)} className="text-red-400"><Trash2 className="w-4 h-4"/></button></td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-
-            <button onClick={addItem} className="text-blue-600 font-bold flex items-center gap-1">+ 新增項目</button>
-
-            <div className="grid md:grid-cols-2 gap-8 pt-6 border-t">
-              <div className="space-y-2">
-                <div className="flex justify-between items-center">
-                  <span className="text-xs font-bold text-slate-500">備註</span>
-                  <button onClick={generateAiNote} className="text-xs text-blue-600 border border-blue-200 px-2 py-1 rounded-full flex items-center gap-1">✨ AI 生成</button>
-                </div>
-                <textarea value={note} onChange={e => setNote(e.target.value)} rows="5" className="w-full p-3 bg-slate-50 border rounded-xl text-sm" />
+          <div className="space-y-4">
+            {/* 客戶與稅率 */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <div className="bg-white p-4 rounded-2xl shadow-sm border border-slate-200 flex items-center gap-3">
+                <Edit2 className="w-4 h-4 text-slate-400" />
+                <input 
+                  placeholder="客戶名稱..." 
+                  value={clientName} 
+                  onChange={e => { setClientName(e.target.value); saveDataToCloud({ clientName: e.target.value }); }} 
+                  className="w-full outline-none text-slate-700 font-bold bg-transparent" 
+                />
               </div>
-              <div className="bg-slate-900 p-6 rounded-2xl text-white space-y-3">
-                <div className="flex justify-between opacity-70"><span>小計</span><span>${totals.sub.toLocaleString()}</span></div>
-                <div className="flex justify-between opacity-70"><span>稅金</span><span>${totals.tax.toLocaleString()}</span></div>
-                <div className="flex justify-between border-t border-white/20 pt-3 font-bold text-xl"><span>總計</span><span className="text-blue-400">${totals.total.toLocaleString()}</span></div>
+              <div className="bg-white p-4 rounded-2xl shadow-sm border border-slate-200 flex items-center gap-3">
+                <span className="text-sm font-bold text-slate-400">稅率(%)</span>
+                <input 
+                  type="number" 
+                  value={taxRate} 
+                  onChange={e => { setTaxRate(Number(e.target.value)); saveDataToCloud({ taxRate: Number(e.target.value) }); }} 
+                  className="w-full outline-none text-slate-700 font-bold bg-transparent text-right" 
+                />
+              </div>
+            </div>
+
+            {/* 報價清單 */}
+            <div className="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden">
+              <div className="bg-slate-50 p-4 border-b border-slate-200 flex justify-between items-center">
+                <span className="text-sm font-bold text-slate-600 flex items-center gap-2"><ListChecks className="w-4 h-4" /> 報價清單</span>
+              </div>
+              <div className="overflow-x-auto">
+                <div className="min-w-[600px] divide-y divide-slate-100">
+                  {items.map((item, index) => (
+                    <div key={item.id} className="grid grid-cols-12 gap-2 p-4 items-center hover:bg-slate-50">
+                      <div className="col-span-4 flex items-center gap-2">
+                        <span className="text-xs font-bold text-slate-300">{index + 1}</span>
+                        <input 
+                          list="presets" 
+                          value={item.name} 
+                          placeholder="項目名稱"
+                          onChange={e => updateItem(item.id, 'name', e.target.value)} 
+                          className="w-full p-1 outline-none text-slate-700 font-semibold bg-transparent" 
+                        />
+                        <datalist id="presets">{presetItems.map(p => <option key={p.id} value={p.name} />)}</datalist>
+                      </div>
+                      <div className="col-span-2"><input value={item.unit} placeholder="單位" onChange={e => updateItem(item.id, 'unit', e.target.value)} className="w-full text-center text-slate-500 outline-none bg-transparent" /></div>
+                      <div className="col-span-2"><input type="number" value={item.price} onChange={e => updateItem(item.id, 'price', Number(e.target.value))} className="w-full text-right text-slate-700 outline-none bg-transparent font-medium" /></div>
+                      <div className="col-span-1"><input type="number" value={item.quantity} onChange={e => updateItem(item.id, 'quantity', Number(e.target.value))} className="w-full text-center text-slate-700 outline-none bg-transparent font-medium" /></div>
+                      <div className="col-span-2 text-right font-black text-slate-800">${Math.round(item.subtotal).toLocaleString()}</div>
+                      <div className="col-span-1 text-right"><button onClick={() => removeItem(item.id)} className="p-1 text-slate-300 hover:text-red-500"><Trash2 className="w-4 h-4"/></button></div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <div className="p-4 bg-slate-50 border-t border-slate-200">
+                <button onClick={addItem} className="w-full py-3 bg-white border border-dashed border-slate-300 rounded-xl text-slate-500 font-bold flex items-center justify-center gap-2 hover:border-slate-400 transition-all"><Plus className="w-5 h-5" /> 新增報價項目</button>
+              </div>
+            </div>
+
+            {/* 總計與備註 */}
+            <div className="grid grid-cols-1 md:grid-cols-5 gap-4">
+              <div className="md:col-span-3 bg-white p-5 rounded-2xl shadow-sm border border-slate-200 space-y-2">
+                <label className="text-xs font-black text-slate-400 uppercase tracking-wider">備註事項</label>
+                <textarea 
+                  value={note} 
+                  onChange={e => { setNote(e.target.value); saveDataToCloud({ note: e.target.value }); }} 
+                  placeholder="付款方式、保固、施工說明..."
+                  rows="5" 
+                  className="w-full p-3 bg-slate-50 rounded-xl text-sm text-slate-600 outline-none resize-none" 
+                />
+              </div>
+              <div className="md:col-span-2 bg-slate-900 p-6 rounded-2xl text-white flex flex-col justify-between shadow-xl">
+                <div className="space-y-4">
+                  <div className="flex justify-between items-center opacity-60 text-sm"><span>項目合計</span><span>${totals.sub.toLocaleString()}</span></div>
+                  <div className="flex justify-between items-center opacity-60 text-sm"><span>稅額 ({taxRate}%)</span><span>${totals.tax.toLocaleString()}</span></div>
+                  <div className="h-px bg-white/10 my-2"></div>
+                  <div className="flex justify-between items-end"><span className="text-sm font-bold text-slate-400">總計金額</span><span className="text-3xl font-black">${totals.total.toLocaleString()}</span></div>
+                </div>
+                <button onClick={() => window.print()} className="mt-6 w-full py-4 bg-blue-600 hover:bg-blue-500 rounded-xl font-black text-white flex items-center justify-center gap-2 transition-all shadow-lg shadow-blue-900/20"><Printer className="w-5 h-5" /> 列印報價單</button>
               </div>
             </div>
           </div>
         ) : (
-          <div className="p-6 space-y-4">
-             {/* 簡易庫存管理省略，保持核心功能 */}
-             <p className="text-slate-500">品項庫功能正常運行中。</p>
+          /* 管理畫面 */
+          <div className="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden">
+            <div className="p-5 border-b border-slate-200 bg-slate-50 flex justify-between items-center">
+              <h3 className="font-black text-slate-800 flex items-center gap-2"><Database className="w-5 h-5" /> 常用項目資料庫</h3>
+              <button onClick={addPreset} className="bg-slate-800 text-white px-4 py-2 rounded-lg text-sm font-bold flex items-center gap-2 shadow-md"><Plus className="w-4 h-4" /> 新增項目</button>
+            </div>
+            <div className="divide-y divide-slate-100 max-h-[60vh] overflow-y-auto">
+              {presetItems.map((p) => (
+                <div key={p.id} className="p-4 flex flex-col sm:flex-row gap-4 items-center">
+                  <div className="flex-1 w-full space-y-1">
+                    <label className="text-[10px] font-bold text-slate-400">名稱</label>
+                    <input value={p.name} onChange={(e) => updatePreset(p.id, 'name', e.target.value)} className="w-full p-2 bg-slate-50 rounded-lg outline-none font-bold text-slate-700" />
+                  </div>
+                  <div className="w-full sm:w-24 space-y-1">
+                    <label className="text-[10px] font-bold text-slate-400 text-center block">單位</label>
+                    <input value={p.unit} onChange={(e) => updatePreset(p.id, 'unit', e.target.value)} className="w-full p-2 bg-slate-50 rounded-lg outline-none text-center" />
+                  </div>
+                  <div className="w-full sm:w-32 space-y-1">
+                    <label className="text-[10px] font-bold text-slate-400 text-right block">預設單價</label>
+                    <input type="number" value={p.price} onChange={(e) => updatePreset(p.id, 'price', Number(e.target.value))} className="w-full p-2 bg-slate-50 rounded-lg outline-none text-right font-black text-slate-700" />
+                  </div>
+                  <div className="pt-5"><button onClick={() => removePreset(p.id)} className="p-2 text-slate-300 hover:text-red-500"><X className="w-5 h-5" /></button></div>
+                </div>
+              ))}
+            </div>
+            <div className="p-5 bg-slate-50 text-center border-t border-slate-100"><p className="text-xs text-slate-400">數據已同步至雲端，更換設備也能繼續使用。</p></div>
           </div>
         )}
       </div>
@@ -188,13 +287,11 @@ const App = () => {
   );
 };
 
-// --- 這就是最關鍵的「啟動開關」 ---
+// --- 啟動 ---
 const rootElement = document.getElementById('root');
 if (rootElement) {
   ReactDOM.createRoot(rootElement).render(
-    <React.StrictMode>
-      <App />
-    </React.StrictMode>
+    <React.StrictMode><App /></React.StrictMode>
   );
 }
 
